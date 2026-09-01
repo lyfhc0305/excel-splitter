@@ -1,0 +1,21 @@
+# Generated build artifacts
+build/
+dist/
+
+# Local input and generated output files
+data/
+output/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Tooling and OS files
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
