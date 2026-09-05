@@ -1,32 +1,32 @@
 from __future__ import annotations
 
 import argparse
-import copy
-import re
+import queue
+import threading
+import sys
+import warnings
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 import tkinter as tk
-from openpyxl.cell import Cell
-from openpyxl.utils import column_index_from_string, get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.utils import get_column_letter
 from tkinter import filedialog, messagebox, ttk
-
-
-CELL_OR_RANGE_PATTERN = re.compile(
-    r"(?P<prefix>(?:'[^']+'|[A-Za-z0-9_]+)!)?"
-    r"(?P<start_col>\$?[A-Z]{1,3})(?P<start_row>\$?\d+)"
-    r"(?::(?P<end_col>\$?[A-Z]{1,3})(?P<end_row>\$?\d+))?"
+from split_core import (
+    normalize_group_value, safe_file_name, collect_groups, collect_group_rows,
+    collect_group_columns, validate_parameters, save_groups, build_target_sheet,
+    build_target_sheet_by_columns, rebuild_formula, rebuild_formula_by_columns,
 )
+
+
 OPENPYXL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 CONVERTIBLE_EXTENSIONS = {".xls", ".et"}
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="按关键列或关键行拆分 Excel，并保留原始表格样式和格式。"
     )
@@ -45,51 +45,73 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--footer-cols", type=int, default=0, help="右侧固定列数（固定在每个文件右侧，row 模式），默认 0")
     parser.add_argument("--key-row", type=int, help="关键行序号，从 1 开始（row 模式）")
     parser.add_argument("--output-dir", help="输出目录，默认在源文件同级目录生成 split_output")
-    return parser.parse_args()
-
-
-def normalize_group_value(value: object) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped or None
-    return str(value)
-
-
-def safe_file_name(name: str) -> str:
-    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name.strip())
-    return cleaned[:80] or "未命名"
+    args = parser.parse_args(argv)
+    supplied = sys.argv[1:] if argv is None else argv
+    if supplied:
+        if not args.input:
+            parser.error("命令行运行必须提供 --input。")
+        required = ("header_cols", "key_row") if args.mode == "row" else ("header_rows", "key_column")
+        for name in required:
+            if getattr(args, name) is None:
+                parser.error(f"缺少参数 --{name.replace('_', '-')}。")
+    return args
 
 
 def load_workbook_compatible(input_path: Path) -> Tuple[openpyxl.Workbook, Optional[tempfile.TemporaryDirectory]]:
+    input_path = Path(input_path)
+    if not input_path.is_file():
+        raise ValueError(f"找不到输入文件：{input_path}")
     suffix = input_path.suffix.lower()
     if suffix in OPENPYXL_EXTENSIONS:
-        return openpyxl.load_workbook(input_path, data_only=False, read_only=False), None
+        return read_workbook(input_path, keep_vba=suffix in {".xlsm", ".xltm"}), None
 
     if suffix == ".et":
-        try:
-            file_handle = input_path.open("rb")
-            workbook = openpyxl.load_workbook(file_handle, data_only=False, read_only=False)
-            workbook._external_file_handle = file_handle
-            return workbook, None
-        except Exception:
-            pass
+        from zipfile import is_zipfile
+        if is_zipfile(input_path):
+            with input_path.open("rb") as file_handle:
+                return read_workbook(file_handle, keep_vba=True), None
 
     if suffix in CONVERTIBLE_EXTENSIONS:
         converted_path, temp_dir = convert_to_xlsx(input_path)
-        return openpyxl.load_workbook(converted_path, data_only=False, read_only=False), temp_dir
+        try:
+            return read_workbook(converted_path), temp_dir
+        except Exception:
+            temp_dir.cleanup()
+            raise
 
     raise ValueError(f"暂不支持该文件格式：{suffix}")
 
 
+def read_workbook(path, **options):
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", UserWarning)
+        workbook = openpyxl.load_workbook(path, data_only=False, read_only=False, rich_text=True, **options)
+    lost_features = [str(item.message) for item in captured if "removed" in str(item.message) or "not supported" in str(item.message)]
+    if lost_features:
+        close_workbook_compatible(workbook, None)
+        raise ValueError("文件包含无法完整保留的功能：" + "；".join(lost_features))
+    return workbook
+
+
+def select_sheet(workbook, name=None):
+    if not workbook.worksheets:
+        raise ValueError("文件中没有可拆分的数据工作表。")
+    if name is None:
+        return workbook.worksheets[0]
+    for sheet in workbook.worksheets:
+        if sheet.title == name:
+            return sheet
+    raise ValueError(f"找不到工作表：{name}")
+
+
 def close_workbook_compatible(workbook: openpyxl.Workbook, temp_dir: Optional[tempfile.TemporaryDirectory]) -> None:
-    external_file_handle = getattr(workbook, "_external_file_handle", None)
-    workbook.close()
-    if external_file_handle:
-        external_file_handle.close()
-    if temp_dir:
-        temp_dir.cleanup()
+    try:
+        workbook.close()
+        if workbook.vba_archive is not None:
+            workbook.vba_archive.close()
+    finally:
+        if temp_dir:
+            temp_dir.cleanup()
 
 
 def convert_to_xlsx(input_path: Path) -> Tuple[Path, tempfile.TemporaryDirectory]:
@@ -97,7 +119,10 @@ def convert_to_xlsx(input_path: Path) -> Tuple[Path, tempfile.TemporaryDirectory
     temp_path = Path(temp_dir.name)
 
     try:
-        converted_path = convert_with_libreoffice(input_path, temp_path)
+        try:
+            converted_path = convert_with_libreoffice(input_path, temp_path)
+        except (OSError, subprocess.SubprocessError):
+            converted_path = None
         if converted_path:
             return converted_path, temp_dir
 
@@ -122,6 +147,7 @@ def convert_with_libreoffice(input_path: Path, output_dir: Path) -> Optional[Pat
     result = subprocess.run(
         [
             executable,
+            f"-env:UserInstallation={(output_dir / 'lo-profile').resolve().as_uri()}",
             "--headless",
             "--convert-to",
             "xlsx",
@@ -133,6 +159,7 @@ def convert_with_libreoffice(input_path: Path, output_dir: Path) -> Optional[Pat
         text=True,
         timeout=120,
         check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
     if result.returncode != 0:
         return None
@@ -180,7 +207,11 @@ $app.DisplayAlerts = $false
 $workbook = $null
 
 try {
-    $workbook = $app.Workbooks.Open($InputPath)
+    $app.AutomationSecurity = 3
+    $workbook = $app.Workbooks.Open($InputPath, 0, $true)
+    if ($workbook.HasVBProject) {
+        throw "文件包含 VBA 宏，转换为 xlsx 会丢失宏。请先使用不含宏的副本。"
+    }
     $workbook.SaveAs($OutputPath, 51)
 } finally {
     if ($null -ne $workbook) {
@@ -189,7 +220,7 @@ try {
     $app.Quit()
 }
 """,
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     result = subprocess.run(
         [
@@ -206,607 +237,49 @@ try {
         text=True,
         timeout=120,
         check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
     if result.returncode != 0 or not output_path.exists():
         return None
     return output_path
 
 
-def copy_workbook_metadata(source_wb: openpyxl.Workbook, target_wb: openpyxl.Workbook) -> None:
-    target_wb.properties = copy.copy(source_wb.properties)
-    target_wb.security = copy.copy(source_wb.security)
-    target_wb.calculation = copy.copy(source_wb.calculation)
-    target_wb.views = copy.copy(source_wb.views)
-    target_wb.code_name = source_wb.code_name
-    target_wb.defined_names = copy.copy(source_wb.defined_names)
-    if source_wb.vba_archive is not None:
-        target_wb.vba_archive = copy.copy(source_wb.vba_archive)
-    target_wb.template = source_wb.template
-    target_wb.iso_dates = source_wb.iso_dates
-
-
-def copy_sheet_settings(source_ws: Worksheet, target_ws: Worksheet) -> None:
-    target_ws.sheet_format = copy.copy(source_ws.sheet_format)
-    target_ws.sheet_properties = copy.copy(source_ws.sheet_properties)
-    target_ws.page_margins = copy.copy(source_ws.page_margins)
-    target_ws.page_setup = copy.copy(source_ws.page_setup)
-    target_ws.print_options = copy.copy(source_ws.print_options)
-    target_ws.views = copy.copy(source_ws.views)
-    target_ws.freeze_panes = source_ws.freeze_panes
-    target_ws.auto_filter = copy.copy(source_ws.auto_filter)
-    target_ws.print_title_cols = source_ws.print_title_cols
-    target_ws.print_title_rows = source_ws.print_title_rows
-    target_ws.oddHeader = copy.copy(source_ws.oddHeader)
-    target_ws.oddFooter = copy.copy(source_ws.oddFooter)
-    target_ws.evenHeader = copy.copy(source_ws.evenHeader)
-    target_ws.evenFooter = copy.copy(source_ws.evenFooter)
-    target_ws.firstHeader = copy.copy(source_ws.firstHeader)
-    target_ws.firstFooter = copy.copy(source_ws.firstFooter)
-
-
-def copy_row_and_column_dimensions(
-    source_ws: Worksheet,
-    target_ws: Worksheet,
-    included_rows: Sequence[int],
-) -> None:
-    for column_key, dimension in source_ws.column_dimensions.items():
-        target_dimension = target_ws.column_dimensions[column_key]
-        target_dimension.width = dimension.width
-        target_dimension.hidden = dimension.hidden
-        target_dimension.bestFit = dimension.bestFit
-        target_dimension.outlineLevel = dimension.outlineLevel
-        target_dimension.outline_level = dimension.outline_level
-        target_dimension.collapsed = dimension.collapsed
-        target_dimension.min = dimension.min
-        target_dimension.max = dimension.max
-
-    for target_row, source_row in enumerate(included_rows, start=1):
-        if source_row in source_ws.row_dimensions:
-            source_dimension = source_ws.row_dimensions[source_row]
-            target_dimension = target_ws.row_dimensions[target_row]
-            target_dimension.height = source_dimension.height
-            target_dimension.hidden = source_dimension.hidden
-            target_dimension.outlineLevel = source_dimension.outlineLevel
-            target_dimension.outline_level = source_dimension.outline_level
-            target_dimension.collapsed = source_dimension.collapsed
-            target_dimension.ht = source_dimension.ht
-
-
-def rebuild_formula(
-    formula: str,
-    row_mapping: Dict[int, int],
-    header_rows: int,
-    footer_start: Optional[int] = None,
-) -> str:
-    def map_single_row(row_number: int) -> int:
-        return row_mapping.get(row_number, row_number)
-
-    def replace(match: re.Match[str]) -> str:
-        prefix = match.group("prefix") or ""
-        start_col = match.group("start_col")
-        start_row_token = match.group("start_row")
-        end_col = match.group("end_col")
-        end_row_token = match.group("end_row")
-
-        start_row = int(start_row_token.replace("$", ""))
-        start_row_is_abs = start_row_token.startswith("$")
-
-        if end_col and end_row_token:
-            end_row = int(end_row_token.replace("$", ""))
-            end_row_is_abs = end_row_token.startswith("$")
-
-            data_rows = [
-                mapped_row
-                for original_row, mapped_row in row_mapping.items()
-                if original_row > header_rows
-                and (footer_start is None or original_row < footer_start)
-                and start_row <= original_row <= end_row
-            ]
-            if data_rows:
-                new_start_row = min(data_rows)
-                new_end_row = max(data_rows)
-            else:
-                new_start_row = map_single_row(start_row)
-                new_end_row = map_single_row(end_row)
-
-            if start_row <= header_rows and end_row <= header_rows:
-                new_start_row = map_single_row(start_row)
-                new_end_row = map_single_row(end_row)
-
-            return (
-                f"{prefix}{start_col}{'$' if start_row_is_abs else ''}{new_start_row}:"
-                f"{end_col}{'$' if end_row_is_abs else ''}{new_end_row}"
-            )
-
-        new_row = map_single_row(start_row)
-        return f"{prefix}{start_col}{'$' if start_row_is_abs else ''}{new_row}"
-
-    return CELL_OR_RANGE_PATTERN.sub(replace, formula)
-
-
-def copy_cell_value_and_style(
-    source_cell: Cell,
-    target_cell: Cell,
-    row_mapping: Dict[int, int],
-    header_rows: int,
-    footer_start: Optional[int] = None,
-) -> None:
-    if source_cell.data_type == "f":
-        formula = str(source_cell.value)
-        if not formula.startswith("="):
-            formula = f"={formula}"
-        target_cell.value = rebuild_formula(
-            formula=formula,
-            row_mapping=row_mapping,
-            header_rows=header_rows,
-            footer_start=footer_start,
-        )
-    else:
-        target_cell.value = source_cell.value
-
-    if source_cell.has_style:
-        target_cell.font = copy.copy(source_cell.font)
-        target_cell.fill = copy.copy(source_cell.fill)
-        target_cell.border = copy.copy(source_cell.border)
-        target_cell.alignment = copy.copy(source_cell.alignment)
-        target_cell.number_format = source_cell.number_format
-        target_cell.protection = copy.copy(source_cell.protection)
-
-    if source_cell.hyperlink:
-        target_cell._hyperlink = copy.copy(source_cell.hyperlink)
-    if source_cell.comment:
-        target_cell.comment = copy.copy(source_cell.comment)
-
-
-def rebuild_merged_ranges(
-    source_ws: Worksheet,
-    target_ws: Worksheet,
-    row_mapping: Dict[int, int],
-    included_rows_set: set[int],
-) -> None:
-    for merged_range in source_ws.merged_cells.ranges:
-        min_col, min_row, max_col, max_row = merged_range.bounds
-        source_rows = set(range(min_row, max_row + 1))
-        if not source_rows.issubset(included_rows_set):
-            continue
-
-        mapped_rows = [row_mapping[row] for row in range(min_row, max_row + 1)]
-        target_ws.merge_cells(
-            f"{get_column_letter(min_col)}{min(mapped_rows)}:{get_column_letter(max_col)}{max(mapped_rows)}"
-        )
-
-
-def build_merged_value_map(ws: Worksheet, key_column: int) -> Dict[int, object]:
-    merged_value_map: Dict[int, object] = {}
-    for merged_range in ws.merged_cells.ranges:
-        min_col, min_row, max_col, max_row = merged_range.bounds
-        if not (min_col <= key_column <= max_col):
-            continue
-        top_left_value = ws.cell(min_row, min_col).value
-        for row in range(min_row, max_row + 1):
-            merged_value_map[row] = top_left_value
-    return merged_value_map
-
-
-def collect_group_rows(
-    ws: Worksheet,
-    header_rows: int,
-    key_column: int,
-    footer_rows: int = 0,
-) -> Dict[str, List[int]]:
-    groups: Dict[str, List[int]] = {}
-    merged_value_map = build_merged_value_map(ws, key_column)
-    last_data_row = ws.max_row - max(0, footer_rows)
-    for row in range(header_rows + 1, last_data_row + 1):
-        raw_value = ws.cell(row=row, column=key_column).value
-        if raw_value is None and row in merged_value_map:
-            raw_value = merged_value_map[row]
-        group_value = normalize_group_value(raw_value)
-        if group_value:
-            groups.setdefault(group_value, []).append(row)
-    return groups
-
-
-def build_target_sheet(
-    source_ws: Worksheet,
-    group_rows: Sequence[int],
-    header_rows: int,
-    source_wb: openpyxl.Workbook,
-    footer_rows: int = 0,
-) -> openpyxl.Workbook:
-    target_wb = openpyxl.Workbook()
-    target_ws = target_wb.active
-    target_ws.title = source_ws.title[:31]
-
-    copy_workbook_metadata(source_wb, target_wb)
-    copy_sheet_settings(source_ws, target_ws)
-
-    footer_count = max(0, footer_rows)
-    footer_row_list = (
-        list(range(source_ws.max_row - footer_count + 1, source_ws.max_row + 1))
-        if footer_count
-        else []
-    )
-    footer_start = footer_row_list[0] if footer_row_list else None
-
-    included_rows = list(range(1, header_rows + 1)) + list(group_rows) + footer_row_list
-    row_mapping = {source_row: target_row for target_row, source_row in enumerate(included_rows, start=1)}
-    included_rows_set = set(included_rows)
-
-    copy_row_and_column_dimensions(source_ws, target_ws, included_rows)
-
-    for source_row in included_rows:
-        target_row = row_mapping[source_row]
-        for column in range(1, source_ws.max_column + 1):
-            source_cell = source_ws.cell(row=source_row, column=column)
-            target_cell = target_ws.cell(row=target_row, column=column)
-            copy_cell_value_and_style(
-                source_cell,
-                target_cell,
-                row_mapping=row_mapping,
-                header_rows=header_rows,
-                footer_start=footer_start,
-            )
-
-    rebuild_merged_ranges(source_ws, target_ws, row_mapping, included_rows_set)
-    target_ws.sheet_state = source_ws.sheet_state
-    target_ws.row_breaks = copy.copy(source_ws.row_breaks)
-    target_ws.col_breaks = copy.copy(source_ws.col_breaks)
-
-    return target_wb
-
-
-# ---------------------------------------------------------------------------
-# 按关键行拆分（把数据列按关键行中的关键字分组，每组列生成一个文件）
-# ---------------------------------------------------------------------------
-
-
-def rebuild_formula_by_columns(
-    formula: str,
-    col_mapping: Dict[int, int],
-    header_cols: int,
-    footer_start: Optional[int] = None,
-) -> str:
-    def map_single_col(col_number: int) -> int:
-        return col_mapping.get(col_number, col_number)
-
-    def replace(match: re.Match[str]) -> str:
-        prefix = match.group("prefix") or ""
-        start_col_token = match.group("start_col")
-        start_row_token = match.group("start_row")
-        end_col_token = match.group("end_col")
-        end_row_token = match.group("end_row")
-
-        start_col = column_index_from_string(start_col_token.replace("$", ""))
-        start_col_is_abs = start_col_token.startswith("$")
-
-        if end_col_token and end_row_token:
-            end_col = column_index_from_string(end_col_token.replace("$", ""))
-            end_col_is_abs = end_col_token.startswith("$")
-
-            data_cols = [
-                mapped_col
-                for original_col, mapped_col in col_mapping.items()
-                if original_col > header_cols
-                and (footer_start is None or original_col < footer_start)
-                and start_col <= original_col <= end_col
-            ]
-            if data_cols:
-                new_start_col = min(data_cols)
-                new_end_col = max(data_cols)
-            else:
-                new_start_col = map_single_col(start_col)
-                new_end_col = map_single_col(end_col)
-
-            if start_col <= header_cols and end_col <= header_cols:
-                new_start_col = map_single_col(start_col)
-                new_end_col = map_single_col(end_col)
-
-            return (
-                f"{prefix}{'$' if start_col_is_abs else ''}{get_column_letter(new_start_col)}{start_row_token}:"
-                f"{'$' if end_col_is_abs else ''}{get_column_letter(new_end_col)}{end_row_token}"
-            )
-
-        new_col = map_single_col(start_col)
-        return f"{prefix}{'$' if start_col_is_abs else ''}{get_column_letter(new_col)}{start_row_token}"
-
-    return CELL_OR_RANGE_PATTERN.sub(replace, formula)
-
-
-def copy_cell_value_and_style_by_columns(
-    source_cell: Cell,
-    target_cell: Cell,
-    col_mapping: Dict[int, int],
-    header_cols: int,
-    footer_start: Optional[int] = None,
-) -> None:
-    if source_cell.data_type == "f":
-        formula = str(source_cell.value)
-        if not formula.startswith("="):
-            formula = f"={formula}"
-        target_cell.value = rebuild_formula_by_columns(
-            formula=formula,
-            col_mapping=col_mapping,
-            header_cols=header_cols,
-            footer_start=footer_start,
-        )
-    else:
-        target_cell.value = source_cell.value
-
-    if source_cell.has_style:
-        target_cell.font = copy.copy(source_cell.font)
-        target_cell.fill = copy.copy(source_cell.fill)
-        target_cell.border = copy.copy(source_cell.border)
-        target_cell.alignment = copy.copy(source_cell.alignment)
-        target_cell.number_format = source_cell.number_format
-        target_cell.protection = copy.copy(source_cell.protection)
-
-    if source_cell.hyperlink:
-        target_cell._hyperlink = copy.copy(source_cell.hyperlink)
-    if source_cell.comment:
-        target_cell.comment = copy.copy(source_cell.comment)
-
-
-def copy_dimensions_by_columns(
-    source_ws: Worksheet,
-    target_ws: Worksheet,
-    included_cols: Sequence[int],
-) -> None:
-    for row_key, source_dimension in source_ws.row_dimensions.items():
-        target_dimension = target_ws.row_dimensions[row_key]
-        target_dimension.height = source_dimension.height
-        target_dimension.hidden = source_dimension.hidden
-        target_dimension.outlineLevel = source_dimension.outlineLevel
-        target_dimension.outline_level = source_dimension.outline_level
-        target_dimension.collapsed = source_dimension.collapsed
-        target_dimension.ht = source_dimension.ht
-
-    source_col_dims: Dict[int, object] = {}
-    for column_key, dimension in source_ws.column_dimensions.items():
-        try:
-            fallback_index = column_index_from_string(column_key)
-        except ValueError:
-            fallback_index = None
-        start = dimension.min or fallback_index
-        if start is None:
-            continue
-        end = dimension.max or start
-        for column in range(start, end + 1):
-            source_col_dims[column] = dimension
-
-    for target_col, source_col in enumerate(included_cols, start=1):
-        dimension = source_col_dims.get(source_col)
-        if dimension is None:
-            continue
-        target_letter = get_column_letter(target_col)
-        target_dimension = target_ws.column_dimensions[target_letter]
-        target_dimension.width = dimension.width
-        target_dimension.hidden = dimension.hidden
-        target_dimension.bestFit = dimension.bestFit
-        target_dimension.outlineLevel = dimension.outlineLevel
-        target_dimension.outline_level = dimension.outline_level
-        target_dimension.collapsed = dimension.collapsed
-        target_dimension.min = target_col
-        target_dimension.max = target_col
-
-
-def rebuild_merged_ranges_by_columns(
-    source_ws: Worksheet,
-    target_ws: Worksheet,
-    col_mapping: Dict[int, int],
-    included_cols_set: set[int],
-) -> None:
-    for merged_range in source_ws.merged_cells.ranges:
-        min_col, min_row, max_col, max_row = merged_range.bounds
-        # 合并区域可能跨越被剔除的数据列（如覆盖整行的标题），
-        # 此时收缩到保留下来的列继续合并。
-        mapped_cols = [
-            col_mapping[col]
-            for col in range(min_col, max_col + 1)
-            if col in included_cols_set
-        ]
-        if not mapped_cols:
-            continue
-        new_min_col, new_max_col = min(mapped_cols), max(mapped_cols)
-        if min_col not in included_cols_set:
-            # 原合并区域左上角所在列被剔除时，把其内容补到新的左上角，
-            # 避免合并后的标题丢失文字。
-            source_top_left = source_ws.cell(row=min_row, column=min_col)
-            target_top_left = target_ws.cell(row=min_row, column=new_min_col)
-            if target_top_left.value is None and source_top_left.value is not None:
-                target_top_left.value = source_top_left.value
-                if source_top_left.has_style:
-                    target_top_left.font = copy.copy(source_top_left.font)
-                    target_top_left.fill = copy.copy(source_top_left.fill)
-                    target_top_left.border = copy.copy(source_top_left.border)
-                    target_top_left.alignment = copy.copy(source_top_left.alignment)
-                    target_top_left.number_format = source_top_left.number_format
-        if new_min_col == new_max_col and min_row == max_row:
-            continue
-        target_ws.merge_cells(
-            f"{get_column_letter(new_min_col)}{min_row}:{get_column_letter(new_max_col)}{max_row}"
-        )
-
-
-def build_merged_value_map_by_row(ws: Worksheet, key_row: int) -> Dict[int, object]:
-    merged_value_map: Dict[int, object] = {}
-    for merged_range in ws.merged_cells.ranges:
-        min_col, min_row, max_col, max_row = merged_range.bounds
-        if not (min_row <= key_row <= max_row):
-            continue
-        top_left_value = ws.cell(min_row, min_col).value
-        for column in range(min_col, max_col + 1):
-            merged_value_map[column] = top_left_value
-    return merged_value_map
-
-
-def collect_group_columns(
-    ws: Worksheet,
-    header_cols: int,
-    key_row: int,
-    footer_cols: int = 0,
-) -> Dict[str, List[int]]:
-    groups: Dict[str, List[int]] = {}
-    merged_value_map = build_merged_value_map_by_row(ws, key_row)
-    last_data_col = ws.max_column - max(0, footer_cols)
-    for column in range(header_cols + 1, last_data_col + 1):
-        raw_value = ws.cell(row=key_row, column=column).value
-        if raw_value is None and column in merged_value_map:
-            raw_value = merged_value_map[column]
-        group_value = normalize_group_value(raw_value)
-        if group_value:
-            groups.setdefault(group_value, []).append(column)
-    return groups
-
-
-def build_target_sheet_by_columns(
-    source_ws: Worksheet,
-    group_cols: Sequence[int],
-    header_cols: int,
-    source_wb: openpyxl.Workbook,
-    footer_cols: int = 0,
-) -> openpyxl.Workbook:
-    target_wb = openpyxl.Workbook()
-    target_ws = target_wb.active
-    target_ws.title = source_ws.title[:31]
-
-    copy_workbook_metadata(source_wb, target_wb)
-    copy_sheet_settings(source_ws, target_ws)
-
-    footer_count = max(0, footer_cols)
-    footer_col_list = (
-        list(range(source_ws.max_column - footer_count + 1, source_ws.max_column + 1))
-        if footer_count
-        else []
-    )
-    footer_start = footer_col_list[0] if footer_col_list else None
-
-    included_cols = list(range(1, header_cols + 1)) + list(group_cols) + footer_col_list
-    col_mapping = {source_col: target_col for target_col, source_col in enumerate(included_cols, start=1)}
-    included_cols_set = set(included_cols)
-
-    copy_dimensions_by_columns(source_ws, target_ws, included_cols)
-
-    for source_col in included_cols:
-        target_col = col_mapping[source_col]
-        for row in range(1, source_ws.max_row + 1):
-            source_cell = source_ws.cell(row=row, column=source_col)
-            target_cell = target_ws.cell(row=row, column=target_col)
-            copy_cell_value_and_style_by_columns(
-                source_cell,
-                target_cell,
-                col_mapping=col_mapping,
-                header_cols=header_cols,
-                footer_start=footer_start,
-            )
-
-    rebuild_merged_ranges_by_columns(source_ws, target_ws, col_mapping, included_cols_set)
-    target_ws.sheet_state = source_ws.sheet_state
-    target_ws.row_breaks = copy.copy(source_ws.row_breaks)
-    target_ws.col_breaks = copy.copy(source_ws.col_breaks)
-
-    return target_wb
-
-
-def split_workbook_by_row(
-    input_path: Path,
-    sheet_name: Optional[str],
-    header_cols: int,
-    key_row: int,
-    output_dir: Optional[Path],
-    footer_cols: int = 0,
-) -> List[Path]:
+def _split_workbook(input_path, sheet_name, leading, key, output_dir, trailing=0, by_columns=False):
+    input_path = Path(input_path)
     source_wb, temp_dir = load_workbook_compatible(input_path)
-    source_ws = source_wb[sheet_name] if sheet_name else source_wb.worksheets[0]
-
     try:
-        footer_cols = max(0, footer_cols)
-        header_cols = max(0, header_cols)
-        if header_cols + footer_cols >= source_ws.max_column:
-            raise ValueError("左侧固定列数与右侧固定列数之和不能大于或等于工作表总列数。")
-        if key_row > source_ws.max_row or key_row < 1:
-            raise ValueError("关键行超出工作表行数范围。")
-
-        groups = collect_group_columns(source_ws, header_cols, key_row, footer_cols)
-        if not groups:
-            raise ValueError("未在关键行中找到可拆分的数据。")
-
-        destination = output_dir or input_path.parent / "split_output"
-        destination.mkdir(parents=True, exist_ok=True)
-
-        output_files: List[Path] = []
-        base_name = input_path.stem
-        for group_name, group_cols in groups.items():
-            target_wb = build_target_sheet_by_columns(
-                source_ws=source_ws,
-                group_cols=group_cols,
-                header_cols=header_cols,
-                source_wb=source_wb,
-                footer_cols=footer_cols,
-            )
-            output_path = destination / f"{base_name}_{safe_file_name(group_name)}.xlsx"
-            target_wb.save(output_path)
-            target_wb.close()
-            output_files.append(output_path)
-
-        return output_files
+        source_ws = select_sheet(source_wb, sheet_name)
+        groups = collect_groups(source_ws, leading, key, trailing, by_columns)
+        return save_groups(source_wb, source_ws, groups, input_path, output_dir, leading, trailing, by_columns)
     finally:
         close_workbook_compatible(source_wb, temp_dir)
 
 
-def split_workbook(
-    input_path: Path,
-    sheet_name: Optional[str],
-    header_rows: int,
-    key_column: int,
-    output_dir: Optional[Path],
-    footer_rows: int = 0,
-) -> List[Path]:
-    source_wb, temp_dir = load_workbook_compatible(input_path)
-    source_ws = source_wb[sheet_name] if sheet_name else source_wb.worksheets[0]
+def split_workbook(input_path, sheet_name, header_rows, key_column, output_dir=None, footer_rows=0):
+    return _split_workbook(input_path, sheet_name, header_rows, key_column, output_dir, footer_rows)
 
-    try:
-        footer_rows = max(0, footer_rows)
-        if header_rows + footer_rows >= source_ws.max_row:
-            raise ValueError("表头行数与表尾行数之和不能大于或等于工作表总行数。")
-        if key_column > source_ws.max_column:
-            raise ValueError("关键列超出工作表最大列数。")
 
-        groups = collect_group_rows(source_ws, header_rows, key_column, footer_rows)
-        if not groups:
-            raise ValueError("未在关键列中找到可拆分的数据。")
+def split_workbook_by_row(input_path, sheet_name, header_cols, key_row, output_dir=None, footer_cols=0):
+    return _split_workbook(input_path, sheet_name, header_cols, key_row, output_dir, footer_cols, True)
 
-        destination = output_dir or input_path.parent / "split_output"
-        destination.mkdir(parents=True, exist_ok=True)
 
-        output_files: List[Path] = []
-        base_name = input_path.stem
-        for group_name, group_rows in groups.items():
-            target_wb = build_target_sheet(
-                source_ws=source_ws,
-                group_rows=group_rows,
-                header_rows=header_rows,
-                source_wb=source_wb,
-                footer_rows=footer_rows,
-            )
-            output_path = destination / f"{base_name}_{safe_file_name(group_name)}.xlsx"
-            target_wb.save(output_path)
-            target_wb.close()
-            output_files.append(output_path)
-
-        return output_files
-    finally:
-        close_workbook_compatible(source_wb, temp_dir)
+def preview_indices(total, *focus):
+    indices = set(range(1, min(total, 20) + 1))
+    indices.update(range(max(1, total - 2), total + 1))
+    for value in focus:
+        if value is not None:
+            indices.update(range(max(1, value - 3), min(total, value + 4) + 1))
+    return sorted(indices)
 
 
 def load_workbook_info(input_path: Path) -> Dict[str, object]:
     workbook, temp_dir = load_workbook_compatible(input_path)
     try:
-        sheet_names = workbook.sheetnames
-        first_sheet = workbook[sheet_names[0]]
+        sheet_names = [sheet.title for sheet in workbook.worksheets]
+        first_sheet = select_sheet(workbook)
         column_preview = []
         preview_row = min(first_sheet.max_row, 6)
-        for column in range(1, first_sheet.max_column + 1):
+        for column in preview_indices(first_sheet.max_column):
             value = first_sheet.cell(preview_row, column).value
             display = normalize_group_value(value) or "(空)"
             column_preview.append(f"{column}. {get_column_letter(column)} - {display}")
@@ -828,17 +301,16 @@ def build_sheet_preview(
     footer_rows: int = 0,
 ) -> Dict[str, object]:
     workbook, temp_dir = load_workbook_compatible(input_path)
-    ws = workbook[sheet_name]
     try:
-        safe_header_rows = max(1, min(header_rows, ws.max_row))
-        safe_key_column = max(1, min(key_column, ws.max_column))
-        safe_footer_rows = max(0, min(footer_rows, ws.max_row - safe_header_rows - 1))
+        ws = select_sheet(workbook, sheet_name)
+        validate_parameters(ws, header_rows, key_column, footer_rows)
+        safe_header_rows, safe_key_column, safe_footer_rows = header_rows, key_column, footer_rows
         footer_start = ws.max_row - safe_footer_rows + 1 if safe_footer_rows else None
 
-        preview_columns = list(range(1, ws.max_column + 1))
+        preview_columns = preview_indices(ws.max_column, safe_key_column)
 
         column_headers: List[str] = []
-        header_reference_row = min(ws.max_row, safe_header_rows)
+        header_reference_row = max(1, min(ws.max_row, safe_header_rows))
         for column in preview_columns:
             header_text = normalize_group_value(ws.cell(row=header_reference_row, column=column).value) or "(空)"
             prefix = "[关键] " if column == safe_key_column else ""
@@ -855,7 +327,7 @@ def build_sheet_preview(
         preview_data_limit = min(ws.max_row, safe_header_rows + 8)
         if footer_start is not None:
             preview_data_limit = min(preview_data_limit, footer_start - 1)
-        for row in range(1, preview_data_limit + 1):
+        for row in preview_indices(preview_data_limit, safe_header_rows):
             row_kind = "header" if row <= safe_header_rows else "data"
             preview_rows.append({"row_no": row, "kind": row_kind, "values": row_values(row)})
             if row == safe_header_rows and row < ws.max_row:
@@ -874,11 +346,13 @@ def build_sheet_preview(
                     "values": ["以下为固定表尾，会附加到每个文件末尾"] + [""] * (len(preview_columns) - 1),
                 }
             )
-            for row in range(footer_start, ws.max_row + 1):
+            for row in preview_indices(ws.max_row, footer_start):
+                if row < footer_start:
+                    continue
                 preview_rows.append({"row_no": row, "kind": "footer", "values": row_values(row)})
 
         key_column_preview: List[str] = []
-        for column in range(1, ws.max_column + 1):
+        for column in preview_columns:
             value = normalize_group_value(ws.cell(header_reference_row, column).value) or "(空)"
             marker = " <关键列>" if column == safe_key_column else ""
             key_column_preview.append(f"{column}. {get_column_letter(column)} - {value}{marker}")
@@ -909,14 +383,13 @@ def build_sheet_preview_by_row(
     footer_cols: int = 0,
 ) -> Dict[str, object]:
     workbook, temp_dir = load_workbook_compatible(input_path)
-    ws = workbook[sheet_name]
     try:
-        safe_header_cols = max(0, min(header_cols, ws.max_column - 1))
-        safe_key_row = max(1, min(key_row, ws.max_row))
-        safe_footer_cols = max(0, min(footer_cols, ws.max_column - safe_header_cols - 1))
+        ws = select_sheet(workbook, sheet_name)
+        validate_parameters(ws, header_cols, key_row, footer_cols, True)
+        safe_header_cols, safe_key_row, safe_footer_cols = header_cols, key_row, footer_cols
         footer_start = ws.max_column - safe_footer_cols + 1 if safe_footer_cols else None
 
-        preview_columns = list(range(1, ws.max_column + 1))
+        preview_columns = preview_indices(ws.max_column, safe_header_cols, footer_start)
 
         column_headers: List[str] = []
         for column in preview_columns:
@@ -938,7 +411,7 @@ def build_sheet_preview_by_row(
 
         preview_rows: List[Dict[str, object]] = []
         preview_limit = min(ws.max_row, max(safe_key_row, 1) + 8)
-        for row in range(1, preview_limit + 1):
+        for row in preview_indices(preview_limit, safe_key_row):
             row_kind = "keyrow" if row == safe_key_row else "data"
             row_label = f"{row} <关键行>" if row == safe_key_row else row
             preview_rows.append({"row_no": row_label, "kind": row_kind, "values": row_values(row)})
@@ -954,9 +427,9 @@ def build_sheet_preview_by_row(
 
         key_row_preview: List[str] = []
         preview_row_limit = min(ws.max_row, 30)
-        for row in range(1, preview_row_limit + 1):
+        for row in sorted(set(range(1, preview_row_limit + 1)) | {safe_key_row}):
             samples: List[str] = []
-            for column in range(1, ws.max_column + 1):
+            for column in preview_columns:
                 value = normalize_group_value(ws.cell(row=row, column=column).value)
                 if value:
                     samples.append(value.replace("\n", " "))
@@ -1005,7 +478,16 @@ class SplitterApp:
         self.summary_var = tk.StringVar(value="先选择 Excel 文件，界面会自动加载工作表和列信息。")
         self.preview_column_map: Dict[str, int] = {}
 
+        self._jobs = queue.Queue()
+        self._results = queue.Queue()
+        self._versions = {}
+        self._preview_after = None
+        self._splitting = False
+        self._closed = False
         self._build_ui()
+        threading.Thread(target=self._worker, daemon=True).start()
+        self._poll_after = self.root.after(75, self._poll_jobs)
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.header_rows_var.trace_add("write", self.on_option_changed)
         self.footer_rows_var.trace_add("write", self.on_option_changed)
         self.key_column_var.trace_add("write", self.on_option_changed)
@@ -1202,7 +684,7 @@ class SplitterApp:
 
         self.row_options.grid_remove()
 
-        summary = ttk.Label(container, textvariable=self.summary_var, style="Summary.TLabel")
+        summary = ttk.Label(container, textvariable=self.summary_var, style="Summary.TLabel", wraplength=900)
         summary.grid(row=5, column=0, columnspan=3, sticky="new", pady=(0, 12))
 
         preview_area = ttk.Frame(container)
@@ -1315,44 +797,87 @@ class SplitterApp:
         self.reload_workbook_info()
 
     def choose_output_dir(self) -> None:
-        initial_dir = self.output_var.get().strip() or self.input_var.get().strip() or "."
+        initial_dir = self.output_var.get().strip() or str(Path(self.input_var.get().strip()).parent)
         path = filedialog.askdirectory(title="选择输出目录", initialdir=initial_dir, mustexist=False)
         if path:
             self.output_var.set(path)
 
+    def _worker(self):
+        while True:
+            job = self._jobs.get()
+            if job is None or self._closed:
+                return
+            kind, version, work, done = job
+            if self._versions.get(kind) != version:
+                continue
+            try:
+                value, error = work(), None
+            except Exception as exc:
+                value, error = None, exc
+            self._results.put((kind, version, done, value, error))
+
+    def _start_job(self, kind, work, done):
+        version = self._versions.get(kind, 0) + 1
+        self._versions[kind] = version
+        self._jobs.put((kind, version, work, done))
+
+    def _poll_jobs(self):
+        try:
+            while True:
+                kind, version, done, value, error = self._results.get_nowait()
+                if self._versions.get(kind) == version:
+                    done(value, error)
+        except queue.Empty:
+            pass
+        finally:
+            if not self._closed:
+                self._poll_after = self.root.after(75, self._poll_jobs)
+
+    def _close(self):
+        if self._splitting:
+            messagebox.showinfo("正在拆分", "请等待当前拆分完成后再关闭窗口。")
+            return
+        self._closed = True
+        self.root.after_cancel(self._poll_after)
+        if self._preview_after is not None:
+            self.root.after_cancel(self._preview_after)
+        self._jobs.put(None)
+        self.root.destroy()
+
     def reload_workbook_info(self) -> None:
         input_path = self.input_var.get().strip()
-        if not input_path:
+        if not input_path or self._splitting:
             return
-
-        try:
-            info = load_workbook_info(Path(input_path))
-        except Exception as exc:
-            messagebox.showerror("读取失败", f"无法读取 Excel 文件：\n{exc}")
-            return
-
-        sheet_names = info["sheet_names"]
-        self.sheet_combo["values"] = sheet_names
-        current_sheet = self.sheet_var.get().strip()
-        if current_sheet not in sheet_names:
-            self.sheet_var.set(sheet_names[0])
-
-        self.summary_var.set(
-            f"共 {len(sheet_names)} 个工作表，默认工作表 {self.sheet_var.get()}，"
-            f"首个工作表共有 {info['max_row']} 行、{info['max_column']} 列。"
-        )
-        self.set_text_content(self.preview_text, info["column_preview"])
-        self.key_column_combo["values"] = info["column_preview"]
-        self.sync_key_column_combo()
+        self._versions["preview"] = self._versions.get("preview", 0) + 1
+        self.summary_var.set("正在读取文件……")
         self.clear_preview_table()
         self.clear_split_preview_table()
-        self.refresh_sheet_preview()
+
+        def done(info, error):
+            if self.input_var.get().strip() != input_path:
+                return
+            if error:
+                self.sheet_var.set("")
+                self.sheet_combo["values"] = ()
+                self.summary_var.set(f"读取失败：{error}")
+                messagebox.showerror("读取失败", str(error))
+                return
+            sheet_names = info["sheet_names"]
+            self.sheet_combo["values"] = sheet_names
+            if self.sheet_var.get().strip() not in sheet_names:
+                self.sheet_var.set(sheet_names[0])
+            self.refresh_sheet_preview()
+
+        self._start_job("load", lambda: load_workbook_info(Path(input_path)), done)
 
     def on_sheet_changed(self, _event: object) -> None:
         self.refresh_sheet_preview()
 
     def on_option_changed(self, *_args: object) -> None:
-        self.root.after_idle(self.refresh_sheet_preview)
+        self._versions["preview"] = self._versions.get("preview", 0) + 1
+        if self._preview_after is not None:
+            self.root.after_cancel(self._preview_after)
+        self._preview_after = self.root.after(300, self.refresh_sheet_preview)
 
     def on_key_column_selected(self, _event: object) -> None:
         selected = self.key_column_combo.get().strip()
@@ -1426,57 +951,57 @@ class SplitterApp:
             self.key_column_var.set(str(mapped))
 
     def refresh_sheet_preview(self) -> None:
+        if self._preview_after is not None:
+            self.root.after_cancel(self._preview_after)
+            self._preview_after = None
+        if self._splitting:
+            return
         input_path = self.input_var.get().strip()
         sheet_name = self.sheet_var.get().strip()
         if not input_path or not sheet_name:
             return
-
+        self._versions["preview"] = self._versions.get("preview", 0) + 1
+        mode = self.mode_var.get()
         try:
-            if self.mode_var.get() == "row":
-                header_cols = self.parse_int(self.header_cols_var.get(), fallback=1)
-                footer_cols = self.parse_int(self.footer_cols_var.get(), fallback=0)
-                key_row = self.parse_int(self.key_row_var.get(), fallback=1)
-                info = build_sheet_preview_by_row(
-                    input_path=Path(input_path),
-                    sheet_name=sheet_name,
-                    header_cols=header_cols,
-                    key_row=key_row,
-                    footer_cols=footer_cols,
-                )
-                self.summary_var.set(
-                    f"当前工作表 {info['sheet_title']}，共有 {info['max_row']} 行、{info['max_column']} 列。"
-                    f" 已按左固定 {header_cols} 列、右固定 {footer_cols} 列、关键行 {key_row} 生成预览，预计拆分为 {info['group_count']} 个对象。"
-                )
-                self.set_text_content(self.preview_text, info["key_row_preview"])
-                self.key_row_combo["values"] = info["key_row_preview"]
-                self.sync_key_row_combo()
-                self.render_preview_table(info["column_headers"], info["preview_rows"])
-                self.render_split_preview_table(info["split_objects"])
+            if mode == "row":
+                leading, trailing, key = map(int, (self.header_cols_var.get(), self.footer_cols_var.get(), self.key_row_var.get()))
+                preview_function = build_sheet_preview_by_row
             else:
-                header_rows = self.parse_int(self.header_rows_var.get(), fallback=6)
-                footer_rows = self.parse_int(self.footer_rows_var.get(), fallback=0)
-                key_column = self.parse_int(self.key_column_var.get(), fallback=1)
-                info = build_sheet_preview(
-                    input_path=Path(input_path),
-                    sheet_name=sheet_name,
-                    header_rows=header_rows,
-                    key_column=key_column,
-                    footer_rows=footer_rows,
-                )
-                self.summary_var.set(
-                    f"当前工作表 {info['sheet_title']}，共有 {info['max_row']} 行、{info['max_column']} 列。"
-                    f" 已按表头 {header_rows} 行、表尾 {footer_rows} 行、关键列 {key_column} 生成预览，预计拆分为 {info['group_count']} 个对象。"
-                )
-                self.set_text_content(self.preview_text, info["key_column_preview"])
-                self.key_column_combo["values"] = info["key_column_preview"]
+                leading, trailing, key = map(int, (self.header_rows_var.get(), self.footer_rows_var.get(), self.key_column_var.get()))
+                preview_function = build_sheet_preview
+        except ValueError:
+            self._preview_error(ValueError("拆分参数必须填写整数。"))
+            return
+        self.summary_var.set("正在生成预览……")
+
+        def done(info, error):
+            if self.input_var.get().strip() != input_path:
+                return
+            if error:
+                self._preview_error(error)
+                return
+            self.summary_var.set(
+                f"工作表 {info['sheet_title']}：{info['max_row']} 行、{info['max_column']} 列；"
+                f"预计生成 {info['group_count']} 个文件（包含空白关键字分组）。预览仅显示部分行列。"
+            )
+            preview_key = "key_row_preview" if mode == "row" else "key_column_preview"
+            self.set_text_content(self.preview_text, info[preview_key])
+            combo = self.key_row_combo if mode == "row" else self.key_column_combo
+            combo["values"] = info[preview_key]
+            if mode == "row":
+                self.sync_key_row_combo()
+            else:
                 self.sync_key_column_combo()
-                self.render_preview_table(info["column_headers"], info["preview_rows"])
-                self.render_split_preview_table(info["split_objects"])
-        except Exception:
-            self.summary_var.set("参数变更后暂时无法生成预览，请检查文件和拆分参数。")
-            self.set_text_content(self.preview_text, ["预览失败"])
-            self.clear_preview_table()
-            self.clear_split_preview_table()
+            self.render_preview_table(info["column_headers"], info["preview_rows"])
+            self.render_split_preview_table(info["split_objects"])
+
+        self._start_job("preview", lambda: preview_function(Path(input_path), sheet_name, leading, key, trailing), done)
+
+    def _preview_error(self, error):
+        self.summary_var.set(f"无法预览：{error}")
+        self.set_text_content(self.preview_text, [str(error)])
+        self.clear_preview_table()
+        self.clear_split_preview_table()
 
     def set_text_content(self, widget: tk.Text, lines: List[str]) -> None:
         widget.configure(state="normal")
@@ -1516,6 +1041,8 @@ class SplitterApp:
                 tags = ("header",)
             elif row["kind"] == "footer":
                 tags = ("footer",)
+            elif row["kind"] == "keyrow":
+                tags = ("keyrow",)
             elif row["kind"] == "split":
                 tags = ("split",)
             self.preview_table.insert("", "end", values=values, tags=tags)
@@ -1559,62 +1086,67 @@ class SplitterApp:
                 return fallback
             raise
 
+    def _set_split_busy(self, busy):
+        self._splitting = busy
+        if busy:
+            self._disabled_widgets = []
+            def visit(widget):
+                for child in widget.winfo_children():
+                    if isinstance(child, (ttk.Entry, ttk.Combobox, ttk.Button, ttk.Radiobutton)):
+                        self._disabled_widgets.append((child, child.cget("state")))
+                        child.configure(state="disabled")
+                    visit(child)
+            visit(self.root)
+        else:
+            for widget, state in self._disabled_widgets:
+                widget.configure(state=state)
+
     def run_split(self) -> None:
+        if self._splitting:
+            return
         input_text = self.input_var.get().strip()
         if not input_text:
             messagebox.showwarning("缺少文件", "请先选择待拆分的 Excel 文件。")
             return
-
         mode = self.mode_var.get()
         try:
-            input_path = Path(input_text)
             if mode == "row":
-                header_cols = self.parse_int(self.header_cols_var.get())
-                footer_cols = self.parse_int(self.footer_cols_var.get(), fallback=0)
-                key_row = self.parse_int(self.key_row_var.get())
+                leading, trailing, key = map(int, (self.header_cols_var.get(), self.footer_cols_var.get(), self.key_row_var.get()))
+                split_function = split_workbook_by_row
             else:
-                header_rows = self.parse_int(self.header_rows_var.get())
-                footer_rows = self.parse_int(self.footer_rows_var.get(), fallback=0)
-                key_column = self.parse_int(self.key_column_var.get())
+                leading, trailing, key = map(int, (self.header_rows_var.get(), self.footer_rows_var.get(), self.key_column_var.get()))
+                split_function = split_workbook
         except ValueError:
-            if mode == "row":
-                messagebox.showwarning("参数错误", "固定列数和关键行序号必须是整数。")
-            else:
-                messagebox.showwarning("参数错误", "表头行数、表尾行数和关键列序号必须是整数。")
+            messagebox.showwarning("参数错误", "固定行列数和关键行列序号必须是整数。")
             return
-
+        input_path = Path(input_text)
+        sheet = self.sheet_var.get().strip() or None
         output_text = self.output_var.get().strip()
         output_dir = Path(output_text) if output_text else None
+        self._versions["preview"] = self._versions.get("preview", 0) + 1
+        self._versions["load"] = self._versions.get("load", 0) + 1
+        self._set_split_busy(True)
+        self.summary_var.set("正在拆分并保存文件，请稍候……")
 
-        try:
-            if mode == "row":
-                files = split_workbook_by_row(
-                    input_path=input_path,
-                    sheet_name=self.sheet_var.get().strip() or None,
-                    header_cols=header_cols,
-                    key_row=key_row,
-                    output_dir=output_dir,
-                    footer_cols=footer_cols,
-                )
+        def done(files, error):
+            self._set_split_busy(False)
+            if error:
+                self.summary_var.set(f"拆分失败：{error}")
+                messagebox.showerror("拆分失败", str(error))
+                return
+            output_parent = files[0].parent
+            self.summary_var.set(f"拆分完成，共生成 {len(files)} 个文件，输出目录：{output_parent}")
+            self.clear_split_preview_table()
+            for path in files:
+                self.split_preview_table.insert("", "end", values=(path.name, "已生成"))
+            summary = f"已生成 {len(files)} 个文件。\n输出目录：{output_parent}\n公式将在 Excel/WPS 打开时重算。"
+            if getattr(files, "warnings", None):
+                self.summary_var.set(f"已生成 {len(files)} 个文件，其中 {len(files.warnings)} 个文件含引用错误，请核对。")
+                messagebox.showwarning("拆分完成，需检查公式", summary + "\n\n" + "\n".join(files.warnings[:10]))
             else:
-                files = split_workbook(
-                    input_path=input_path,
-                    sheet_name=self.sheet_var.get().strip() or None,
-                    header_rows=header_rows,
-                    key_column=key_column,
-                    output_dir=output_dir,
-                    footer_rows=footer_rows,
-                )
-        except Exception as exc:
-            messagebox.showerror("拆分失败", str(exc))
-            return
+                messagebox.showinfo("拆分完成", summary)
 
-        output_parent = files[0].parent if files else (output_dir or input_path.parent / "split_output")
-        self.summary_var.set(f"拆分完成，共生成 {len(files)} 个文件，输出目录：{output_parent}")
-        self.clear_split_preview_table()
-        for path in files:
-            self.split_preview_table.insert("", "end", values=(Path(path).name, "已生成"))
-        messagebox.showinfo("拆分完成", f"已生成 {len(files)} 个文件。\n输出目录：{output_parent}")
+        self._start_job("split", lambda: split_function(input_path, sheet, leading, key, output_dir, trailing), done)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -1641,15 +1173,18 @@ def run_cli(args: argparse.Namespace) -> None:
         )
     summary = "\n".join(str(path) for path in files)
     print(f"拆分完成，共生成 {len(files)} 个文件：\n{summary}")
+    for warning in getattr(files, "warnings", []):
+        print(f"公式提示：{warning}", file=sys.stderr)
 
 
 def main() -> None:
     args = parse_args()
-    if args.input and args.mode == "row" and args.header_cols is not None and args.key_row:
-        run_cli(args)
-        return
-    if args.input and args.mode == "column" and args.header_rows and args.key_column:
-        run_cli(args)
+    if args.input:
+        try:
+            run_cli(args)
+        except Exception as exc:
+            print(f"拆分失败：{exc}", file=sys.stderr)
+            raise SystemExit(1)
         return
     SplitterApp().run()
 

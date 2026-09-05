@@ -12,9 +12,9 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-rm -rf build dist
+python -m unittest discover -s tests
 
-pyinstaller \
+python -m PyInstaller \
   --noconfirm \
   --clean \
   --windowed \
