@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import os
 import re
+import shutil
 import tempfile
 from itertools import chain
 from bisect import bisect_left, bisect_right
@@ -12,26 +14,111 @@ from pathlib import Path
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 from openpyxl.formula.tokenizer import Tokenizer, TokenizerError
-from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter, quote_sheetname
 from openpyxl.worksheet.cell_range import CellRange
 
 
 CELL = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)\Z")
 AXIS = re.compile(r"(\$?)([A-Za-z]{1,3}|[1-9][0-9]*)\Z")
+PLACEHOLDER = re.compile(r'\{([^{}]*)\}')
+NAME_FIELDS = ('文件名', '关键字', '序号', '工作表')
+DEFAULT_NAME_TEMPLATE = '{文件名}_{关键字}'
+
+
+class SplitCancelled(Exception):
+    """Raised between groups when the caller asks to stop; nothing is published."""
 
 
 def normalize_group_value(value):
     if value is None:
         return None
+    if isinstance(value, bool):
+        return 'TRUE' if value else 'FALSE'
+    if isinstance(value, float):
+        # Excel shows 15 significant digits: 3.0 groups with 3 and "3", 0.1+0.2 with 0.3.
+        value = int(value) if value.is_integer() and abs(value) < 1e15 else format(value, '.15g')
+    elif isinstance(value, datetime.datetime) and value.time() == datetime.time():
+        value = value.date()
     return str(value).strip() or None
 
 
-def safe_file_name(name):
+def safe_file_name(name, limit=80):
     cleaned = re.sub(r'[\x00-\x1f\\/:*?"<>|]+', '_', str(name).strip())
-    cleaned = cleaned[:80].rstrip(' .') or '未命名'
+    cleaned = cleaned[:limit].rstrip(' .') or '未命名'
     if re.fullmatch(r'(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?', cleaned, re.I):
         cleaned = '_' + cleaned
     return cleaned
+
+
+def unique_name(stem, used, suffix='.xlsx'):
+    name, number = stem + suffix, 2
+    while name.casefold() in used:
+        name = f'{stem}_{number}{suffix}'
+        number += 1
+    used.add(name.casefold())
+    return name
+
+
+def validate_name_template(template):
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError('文件命名规则不能为空。')
+    fields = PLACEHOLDER.findall(template)
+    unknown = [field for field in fields if field not in NAME_FIELDS]
+    if unknown:
+        raise ValueError(f'文件命名规则含未知占位符 {{{unknown[0]}}}；可用 {{文件名}}、{{关键字}}、{{序号}}、{{工作表}}。')
+    if '{' in PLACEHOLDER.sub('', template) or '}' in PLACEHOLDER.sub('', template):
+        raise ValueError('文件命名规则中的花括号不成对。')
+    if '关键字' not in fields and '序号' not in fields:
+        raise ValueError('文件命名规则必须包含 {关键字} 或 {序号}，否则无法区分各个文件。')
+
+
+def plan_file_names(template, source_stem, sheet_title, group_names, reserved=()):
+    """Name each group's file from the template; duplicates get a numeric suffix."""
+    validate_name_template(template)
+    used = {name.casefold() for name in reserved}
+    width = len(str(len(group_names)))
+    names = []
+    for index, group_name in enumerate(group_names, 1):
+        values = {'文件名': source_stem, '关键字': group_name, '序号': str(index).zfill(width), '工作表': sheet_title}
+        stem = PLACEHOLDER.sub(lambda match: safe_file_name(values[match[1]]), template)
+        names.append(unique_name(safe_file_name(stem, 180), used))
+    return names
+
+
+def safe_sheet_title(name, used):
+    """Return an Excel-valid worksheet title that is unique within ``used``."""
+    title = re.sub(r"[\x00-\x1f\\/?*\[\]:]", '_', str(name)).strip()
+    title = title[:31].strip().strip("'") or '未命名'
+    if title.casefold() == 'history':  # Reserved by Excel.
+        title = title[:30] + '_'
+    base, number = title, 2
+    while title.casefold() in used:
+        tail = f'_{number}'
+        title = base[:31 - len(tail)] + tail
+        number += 1
+    used.add(title.casefold())
+    return title
+
+
+def plan_sheet_titles(group_names):
+    used = set()
+    return [safe_sheet_title(name, used) for name in group_names]
+
+
+def select_groups(groups, names=None):
+    """Keep the requested groups in sheet order; unknown names are reported, not skipped."""
+    if names is None:
+        return groups
+    wanted = [str(name).strip() for name in names]
+    missing = [name for name in wanted if name not in groups]
+    if missing:
+        more = '等' if len(missing) > 5 else ''
+        raise ValueError(f'找不到拆分对象：{"、".join(missing[:5])}{more}。请先预览确认关键字。')
+    chosen = set(wanted)
+    selected = {name: indices for name, indices in groups.items() if name in chosen}
+    if not selected:
+        raise ValueError('没有选择任何拆分对象。')
+    return selected
 
 
 def validate_parameters(ws, leading, key, trailing, by_columns=False):
@@ -47,6 +134,11 @@ def validate_parameters(ws, leading, key, trailing, by_columns=False):
         raise ValueError(f'{labels[0]}与{labels[2]}之和必须小于工作表总{"列" if by_columns else "行"}数。')
     if not 1 <= key <= key_size:
         raise ValueError(f'{labels[1]}必须在 1 到 {key_size} 之间。')
+
+
+class Groups(dict):
+    """Group name -> retained indices, in order of first appearance."""
+    blank = None  # Label of the blank-key group, if the sheet has one.
 
 
 def collect_groups(ws, leading, key, trailing=0, by_columns=False):
@@ -73,7 +165,9 @@ def collect_groups(ws, leading, key, trailing=0, by_columns=False):
     blank_label = '（空白关键字）'
     while blank_label in groups:
         blank_label += '_'
-    return {(blank_label if name is None else name): indices for name, indices in groups.items()}
+    result = Groups((blank_label if name is None else name, indices) for name, indices in groups.items())
+    result.blank = blank_label if None in groups else None
+    return result
 
 
 def collect_group_rows(ws, header_rows, key_column, footer_rows=0):
@@ -85,11 +179,12 @@ def collect_group_columns(ws, header_cols, key_row, footer_cols=0):
 
 
 class ReferenceMapper:
-    def __init__(self, mapping, by_columns=False, sheet_name=None):
+    def __init__(self, mapping, by_columns=False, sheet_name=None, target_name=None):
         self.mapping = mapping
         self.indices = sorted(mapping)
         self.by_columns = by_columns
         self.sheet_name = sheet_name
+        self.target_name = target_name
         self.names = set()
 
     def interval(self, start, end):
@@ -108,6 +203,8 @@ class ReferenceMapper:
             decoded = sheet[1:-1].replace("''", "'") if sheet.startswith("'") and sheet.endswith("'") else sheet
             if self.sheet_name is None or decoded.casefold() != self.sheet_name.casefold():
                 raise ValueError(f'公式引用了其他工作表或外部文件：{sheet}!{text}。请先将这类引用转换为值后拆分。')
+            if self.target_name is not None and self.target_name != self.sheet_name:
+                sheet = quote_sheetname(self.target_name)
             prefix = sheet + '!'
         parts = text.split(':')
         matches = [CELL.fullmatch(part) for part in parts]
@@ -360,14 +457,17 @@ def copy_rules(source, target, mapper):
                 target.conditional_formatting.add(mapped, result)
 
 
-def build_target(source_ws, group, leading, source_wb, trailing=0, by_columns=False, cell_index=None):
-    validate_features(source_wb, source_ws)
+def included_indices(source_ws, group, leading, trailing=0, by_columns=False):
     size = source_ws.max_column if by_columns else source_ws.max_row
-    included = list(range(1, leading + 1)) + list(group) + list(range(size - trailing + 1, size + 1))
-    mapper = ReferenceMapper({old: new for new, old in enumerate(included, 1)}, by_columns, source_ws.title)
+    return list(range(1, leading + 1)) + list(group) + list(range(size - trailing + 1, size + 1))
+
+
+def output_workbook(source_wb):
+    """An empty workbook carrying the source's workbook-level settings (no sheets yet)."""
     target_wb = openpyxl.Workbook()
-    target = target_wb.active
-    target.title = source_ws.title
+    # Sheets are created with their final titles: renaming the default "Sheet" to a
+    # case variant such as "sheet" would make openpyxl silently append a number.
+    target_wb.remove(target_wb.active)
     for name in ('properties', 'security', 'calculation'):
         setattr(target_wb, name, copy.deepcopy(getattr(source_wb, name)))
     target_wb.epoch = source_wb.epoch
@@ -378,6 +478,12 @@ def build_target(source_ws, group, leading, source_wb, trailing=0, by_columns=Fa
         target_wb.calculation.fullCalcOnLoad = True
         target_wb.calculation.forceFullCalc = True
         target_wb.calculation.calcMode = 'auto'
+    return target_wb
+
+
+def fill_sheet(source_wb, source_ws, target, included, by_columns=False, cell_index=None, local_names=False):
+    """Copy the retained rows/columns of ``source_ws`` into the empty sheet ``target``."""
+    mapper = ReferenceMapper({old: new for new, old in enumerate(included, 1)}, by_columns, source_ws.title, target.title)
     copy_settings(source_ws, target, mapper)
     copy_dimensions(source_ws, target, mapper)
     # Visit only populated/styled cells; do not expand sparse sheets into a dense grid.
@@ -399,7 +505,9 @@ def build_target(source_ws, group, leading, source_wb, trailing=0, by_columns=Fa
             target.merge_cells(mapped)
     copy_rules(source_ws, target, mapper)
     # Keep only names needed by the output; unrelated names may refer to omitted sheets.
-    available = {name.name.casefold(): (name, target_wb) for name in source_wb.defined_names.values()}
+    # Sheets sharing one workbook map rows differently, so their names must be sheet-local.
+    workbook_scope = target if local_names else target.parent
+    available = {name.name.casefold(): (name, workbook_scope) for name in source_wb.defined_names.values()}
     available.update({name.name.casefold(): (name, target) for name in source_ws.defined_names.values()})
     processed = set()
     while mapper.names - processed:
@@ -411,9 +519,41 @@ def build_target(source_ws, group, leading, source_wb, trailing=0, by_columns=Fa
         result = copy.deepcopy(name)
         result.attr_text = mapper.formula(name.attr_text)
         if destination is target:
-            result.localSheetId = 0
+            result.localSheetId = target.parent.index(target)
         destination.defined_names.add(result)
+    return mapper
+
+
+def build_target(source_ws, group, leading, source_wb, trailing=0, by_columns=False, cell_index=None):
+    validate_features(source_wb, source_ws)
+    target_wb = output_workbook(source_wb)
+    target = target_wb.create_sheet(source_ws.title)
+    fill_sheet(source_wb, source_ws, target, included_indices(source_ws, group, leading, trailing, by_columns), by_columns, cell_index)
     return target_wb
+
+
+def build_combined(source_ws, groups, leading, source_wb, trailing=0, by_columns=False, cell_index=None, step=None):
+    """One workbook holding every group as its own worksheet, named after the group."""
+    validate_features(source_wb, source_ws)
+    target_wb = output_workbook(source_wb)
+    for index, (title, (group_name, indices)) in enumerate(zip(plan_sheet_titles(list(groups)), groups.items())):
+        if step is not None:
+            step(index, group_name)
+        target = target_wb.create_sheet(title)
+        fill_sheet(source_wb, source_ws, target, included_indices(source_ws, indices, leading, trailing, by_columns),
+                   by_columns, cell_index, local_names=True)
+        if index:
+            target.sheet_properties.codeName = None  # VBA code names must be unique.
+        for view in target.views.sheetView:
+            view.tabSelected = index == 0  # Several selected tabs would open as a sheet group.
+    target_wb.active = 0
+    return target_wb
+
+
+def broken_references(sheet):
+    return [cell.coordinate for cell in sheet._cells.values()
+            if (cell.data_type == 'f' and '#REF!' in str(cell.value)) or
+            (cell.data_type == 'e' and cell.value == '#REF!')]
 
 
 def build_target_sheet(source_ws, group_rows, header_rows, source_wb, footer_rows=0):
@@ -428,48 +568,72 @@ class SplitFiles(list):
     def __init__(self):
         super().__init__()
         self.warnings = []
+        self.sheet_titles = []
 
 
-def save_groups(source_wb, source_ws, groups, input_path, output_dir, leading, trailing, by_columns=False):
+def save_groups(source_wb, source_ws, groups, input_path, output_dir, leading, trailing, by_columns=False,
+                name_template=DEFAULT_NAME_TEMPLATE, single_workbook=False, progress=None, cancel=None):
+    """Write each group to its own file, or all groups as sheets of one workbook.
+
+    ``progress(done, total, group_name)`` is called before each group and once more before
+    publishing; setting the ``cancel`` event stops at the next group and publishes nothing.
+    """
     validate_features(source_wb, source_ws)
+    input_path = Path(input_path)
+    template = DEFAULT_NAME_TEMPLATE if name_template is None else name_template
+    if not single_workbook:
+        validate_name_template(template)  # Before creating any output directory.
     destination = Path(output_dir) if output_dir else input_path.parent / 'split_output'
     destination.mkdir(parents=True, exist_ok=True)
     reserved = {path.name.casefold() for path in destination.iterdir()}
     reserved.add(input_path.name.casefold())
     outputs = SplitFiles()
+    total = len(groups)
     cell_index = {}
     for cell in source_ws._cells.values():
         cell_index.setdefault(cell.column if by_columns else cell.row, []).append(cell)
+
+    def step(done, group_name=None):
+        if cancel is not None and cancel.is_set():
+            raise SplitCancelled('已取消拆分，未生成任何文件。')
+        if progress is not None:
+            progress(done, total, group_name)
+
     # Stage the whole batch before publishing; save failures never leave half-written outputs.
     with tempfile.TemporaryDirectory(prefix='.split-', dir=destination) as staging:
         staged = []
-        for index, (group_name, indices) in enumerate(groups.items()):
-            stem = f'{safe_file_name(input_path.stem)}_{safe_file_name(group_name)}'
-            name, suffix = stem + '.xlsx', 2
-            while name.casefold() in reserved:
-                name = f'{stem}_{suffix}.xlsx'
-                suffix += 1
-            reserved.add(name.casefold())
-            path = destination / name
-            workbook = build_target(source_ws, indices, leading, source_wb, trailing, by_columns, cell_index)
+
+        def stage(workbook, name, index):
             try:
-                broken = [cell.coordinate for cell in workbook.active._cells.values()
-                          if (cell.data_type == 'f' and '#REF!' in str(cell.value)) or
-                          (cell.data_type == 'e' and cell.value == '#REF!')]
-                if broken:
-                    outputs.warnings.append(f'{name}：{len(broken)} 个单元格含 #REF!（如 {"、".join(broken[:5])}），请核对被剔除数据的引用。')
+                for sheet in workbook.worksheets:
+                    broken = broken_references(sheet)
+                    if broken:
+                        label = f'{name} 的“{sheet.title}”工作表' if single_workbook else name
+                        outputs.warnings.append(f'{label}：{len(broken)} 个单元格含 #REF!（如 {"、".join(broken[:5])}），请核对被剔除数据的引用。')
                 temp_path = Path(staging) / f'{index}.xlsx'
                 workbook.save(temp_path)
             finally:
                 workbook.close()
-            staged.append((temp_path, path))
+            staged.append((temp_path, destination / name))
+
+        if single_workbook:
+            name = unique_name(f'{safe_file_name(input_path.stem)}_拆分', reserved)
+            workbook = build_combined(source_ws, groups, leading, source_wb, trailing, by_columns, cell_index, step)
+            outputs.sheet_titles = workbook.sheetnames
+            step(total)
+            stage(workbook, name, 0)
+        else:
+            names = plan_file_names(template, input_path.stem, source_ws.title, list(groups), reserved)
+            for index, ((group_name, indices), name) in enumerate(zip(groups.items(), names)):
+                step(index, group_name)
+                stage(build_target(source_ws, indices, leading, source_wb, trailing, by_columns, cell_index), name, index)
+            step(total)
         try:
             for temp_path, path in staged:
                 # Exclusive creation also protects against another run choosing this name.
                 with path.open('xb') as output:
                     outputs.append(path)
                     with temp_path.open('rb') as source:
-                        import shutil
                         shutil.copyfileobj(source, output)
                     output.flush()
                     os.fsync(output.fileno())
