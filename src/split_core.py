@@ -315,7 +315,9 @@ def validate_features(wb, ws):
 def copy_settings(source, target, mapper):
     for name in ('sheet_format', 'sheet_properties', 'page_margins', 'page_setup', 'print_options', 'views',
                  'protection', 'oddHeader', 'oddFooter', 'evenHeader', 'evenFooter', 'firstHeader', 'firstFooter'):
-        setattr(target, name, copy.deepcopy(getattr(source, name)))
+        # page_setup links back to its worksheet; point that link at the target instead of
+        # deep-copying the whole source workbook (which also fails once it holds a VBA archive).
+        setattr(target, name, copy.deepcopy(getattr(source, name), {id(source): target}))
     # A single-sheet output must have a visible active sheet and valid view references.
     target.sheet_state = 'visible'
     for view in target.views.sheetView:

@@ -3,6 +3,7 @@ import datetime
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import openpyxl
+from openpyxl.comments import Comment
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import Font, PatternFill
 from openpyxl.workbook.defined_name import DefinedName
@@ -357,6 +359,49 @@ class SplitTests(unittest.TestCase):
                 finally:
                     temporary.cleanup()
 
+
+    def test_xlsx_core_et_and_macro_free_xlsm_split(self):
+        # These load with a VBA archive attached. A sheet without <pageSetup> keeps openpyxl's
+        # back-link from page_setup to the sheet, which must not drag the workbook into a copy.
+        for orientation in (None, 'landscape'):
+            wb, ws = self.save([['部门', '值'], ['甲', 1], ['乙', 2], ['甲', '=B2*2']])
+            if orientation:
+                ws.page_setup.orientation = orientation
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            ws.print_title_rows = '1:1'
+            ws.auto_filter.ref = 'A1:B4'
+            ws.freeze_panes = 'A2'
+            ws['A2'].comment = Comment('备注', '作者')
+            ws['A3'].hyperlink = '#Sheet!A1'
+            dv = DataValidation(type='whole', operator='between', formula1='0', formula2='10')
+            dv.add('B2:B4')
+            ws.add_data_validation(dv)
+            ws.conditional_formatting.add('B2:B4', FormulaRule(formula=['B2>1'], fill=PatternFill('solid', fgColor='FFFF0000')))
+            wb.defined_names.add(DefinedName('Amounts', attr_text="'Sheet'!$B$2:$B$3"))
+            ws['C2'] = '=SUM(Amounts)'
+            wb.save(self.source)
+            for suffix in ('.et', '.xlsm'):
+                source = self.source.with_name(f'源表{suffix}')
+                shutil.copy(self.source, source)
+                self.assertEqual(app.build_sheet_preview(source, 'Sheet', 1, 1)['group_count'], 2)
+                for single in (False, True):
+                    with self.subTest(orientation=orientation, suffix=suffix, single=single):
+                        folder = self.out / f'{orientation}{suffix}{single}'
+                        files = app.split_workbook(source, None, 1, 1, folder, single_workbook=single)
+                        result = openpyxl.load_workbook(files[0])
+                        target = result.worksheets[0]
+                        self.assertEqual([row[1] for row in target.iter_rows(min_row=2, values_only=True)], [1, '=B2*2'])
+                        self.assertEqual(target.page_setup.orientation, orientation)
+                        self.assertTrue(target.sheet_properties.pageSetUpPr.fitToPage)
+                        self.assertEqual(target['A2'].comment.text, '备注')
+                        result.close()
+
+    def test_page_setup_links_to_output_sheet(self):
+        self.save([['部门'], ['甲'], ['乙']])
+        wb = openpyxl.load_workbook(self.source)
+        target = core.build_target(wb.active, [2], 1, wb).active
+        self.assertIs(target.page_setup._parent, target)
+        wb.close()
 
     def test_sheet_named_like_default_keeps_title(self):
         wb = openpyxl.Workbook()
