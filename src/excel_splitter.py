@@ -22,7 +22,7 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from split_core import (
     DEFAULT_NAME_TEMPLATE, SplitCancelled, normalize_group_value, safe_file_name, collect_groups,
     collect_group_rows, collect_group_columns, validate_parameters, save_groups, build_target_sheet,
-    build_target_sheet_by_columns, rebuild_formula, rebuild_formula_by_columns, plan_file_names,
+    build_target_sheet_by_columns, plan_file_names, unique_name,
     plan_sheet_titles, select_groups, validate_name_template,
 )
 
@@ -1339,6 +1339,8 @@ class SplitterApp:
     def _on_output_edited(self, *_args) -> None:
         if not self._setting_output:
             self._output_auto = False
+        # The destination decides which names are already taken, so re-plan on every change.
+        self.update_group_names()
 
     def choose_output_dir(self) -> None:
         initial_dir = self.output_var.get().strip() or str(Path(self.input_var.get().strip()).parent)
@@ -1740,6 +1742,21 @@ class SplitterApp:
     def _selected_names(self) -> List[str]:
         return [item["name"] for item in self.groups or () if item["name"] not in self.excluded]
 
+    def _reserved_output_names(self) -> set:
+        """Names ``save_groups`` will refuse to overwrite, so the previewed names are the
+        ones actually written instead of ones the split then has to renumber."""
+        reserved = set()
+        input_text = self.input_var.get().strip()
+        if input_text:
+            reserved.add(Path(input_text).name)
+        destination = self._output_dir()
+        if destination is not None:
+            try:
+                reserved.update(path.name for path in destination.iterdir())
+            except OSError:
+                pass  # Missing or unreadable right now; the split itself reports that later.
+        return reserved
+
     def update_group_names(self) -> None:
         """Refresh checkboxes, planned output names, counts and the start button."""
         tree = self.split_preview_table
@@ -1747,13 +1764,14 @@ class SplitterApp:
         single = self.output_mode_var.get() == "workbook"
         input_text = self.input_var.get().strip()
         stem = safe_file_name(Path(input_text).stem) if input_text else "源文件名"
-        planned, error = {}, None
+        reserved = self._reserved_output_names()
+        planned, error, workbook_name = {}, None, None
         if single:
+            workbook_name = unique_name(f"{stem}_拆分", {name.casefold() for name in reserved})
             planned = dict(zip(selected, plan_sheet_titles(selected)))
         else:
             try:
                 sheet = (self._preview_info or {}).get("sheet_title", self.sheet_var.get())
-                reserved = {Path(input_text).name} if input_text else set()
                 planned = dict(zip(selected, plan_file_names(self.name_template_var.get(), Path(input_text).stem or "源文件名",
                                                              sheet, selected, reserved)))
             except ValueError as exc:
@@ -1777,7 +1795,7 @@ class SplitterApp:
         if single:
             self.template_label.configure(text="输出文件")
             self.template_entry.grid_remove()
-            self.workbook_hint.configure(text=f"{stem}_拆分.xlsx（每个对象一个工作表）")
+            self.workbook_hint.configure(text=f"{workbook_name}（每个对象一个工作表）")
             self.workbook_hint.grid()
             self.template_hint.grid_remove()
         else:

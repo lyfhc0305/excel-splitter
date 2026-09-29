@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import gc
 import io
 import json
 import os
@@ -18,6 +19,7 @@ from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import Font, PatternFill
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.pagebreak import Break
 from openpyxl.utils.datetime import CALENDAR_MAC_1904
 
@@ -233,6 +235,34 @@ class SplitTests(unittest.TestCase):
         self.assertEqual(wb.active['B2'].data_type, 's')
         self.assertEqual(wb.active['B2'].value, '=hello')
         wb.close()
+
+    def test_hyperlink_to_other_sheet_is_kept_not_fatal(self):
+        # The other sheet is untouched by the split and absent from the output, so the
+        # location cannot be rewritten — but it must not stop the whole run either.
+        wb, ws = self.save([['部门', '链接'], ['甲', None], ['乙', None]])
+        wb.create_sheet('说明')['A1'] = '见此'
+        ws['B2'].hyperlink = Hyperlink(ref='B2', location='说明!A1')
+        wb.save(self.source)
+        file = self.split()[0]
+        wb = openpyxl.load_workbook(file)
+        try:
+            self.assertEqual(wb.active['B2'].hyperlink.location, '说明!A1')
+        finally:
+            wb.close()
+
+    def test_same_sheet_hyperlink_follows_retained_rows(self):
+        wb, ws = self.save([['部门', '链接'], ['甲', None], ['乙', None], ['甲', None]])
+        ws['B2'].hyperlink = Hyperlink(ref='B2', location='Sheet!A4')
+        ws['B4'].hyperlink = Hyperlink(ref='B4', location='Sheet!A3')
+        wb.save(self.source)
+        file = self.split()[0]
+        wb = openpyxl.load_workbook(file)
+        try:
+            self.assertEqual(wb.active['B2'].hyperlink.location, 'Sheet!A3')
+            # Source row 4 lands on row 3 of the output, and its target (row 3, 乙) was dropped.
+            self.assertEqual(wb.active['B3'].hyperlink.location, '#REF!')
+        finally:
+            wb.close()
 
     def test_late_save_failure_publishes_nothing(self):
         self.save([['部门'], ['甲'], ['乙']])
@@ -559,10 +589,27 @@ class BackgroundInterfaceTests(unittest.TestCase):
         with patch.object(app.tk, 'Tk', return_value=self.root):
             return app.SplitterApp(settings_path=self.settings)
 
+    def close_gui(self):
+        """Shut one Tk application down before the next test builds another one.
+
+        ``_close`` destroys the root immediately; events still queued for it would only
+        run while the interpreter is being finalized and print Tcl tracebacks, so drain
+        them first and drop every reference to the destroyed application.
+        """
+        if getattr(self, 'gui', None) is None:
+            return
+        self.gui._splitting = False
+        try:
+            self.root.update()
+        except app.tk.TclError:
+            pass
+        self.gui._close()
+        self.gui = None
+        self.root = None
+        gc.collect()
+
     def tearDown(self):
-        if getattr(self, 'gui', None) is not None:
-            self.gui._splitting = False
-            self.gui._close()
+        self.close_gui()
         self.temp.cleanup()
 
     def make_source(self, name='源表.xlsx', rows=None):
@@ -680,16 +727,52 @@ class BackgroundInterfaceTests(unittest.TestCase):
         self.gui.load_input_path(first)
         self.assertEqual(self.gui.output_var.get(), str(self.folder / 'custom'))
 
+    def test_planned_names_avoid_files_already_in_the_output_dir(self):
+        source = self.make_source()
+        out = source.parent / 'split_output'
+        out.mkdir()
+        (out / '源表_甲.xlsx').write_bytes(b'occupied')
+        self.load(source)
+        planned = {name: self.gui.split_preview_table.set(iid, 'output')
+                   for iid, name in self.gui.group_items.items()}
+        self.assertEqual(planned, {'甲': '源表_甲_2.xlsx', '乙': '源表_乙.xlsx', '丙': '源表_丙.xlsx'})
+        files = app.split_workbook(source, None, 1, 1, out)
+        self.assertEqual({path.name for path in files}, set(planned.values()))
+        self.assertEqual((out / '源表_甲.xlsx').read_bytes(), b'occupied')
+
+    def test_single_workbook_hint_matches_the_written_file(self):
+        source = self.make_source()
+        out = source.parent / 'split_output'
+        out.mkdir()
+        (out / '源表_拆分.xlsx').write_bytes(b'occupied')
+        self.load(source)
+        self.gui.output_mode_var.set('workbook')
+        self.gui.update_group_names()
+        self.assertEqual(self.gui.workbook_hint.cget('text'), '源表_拆分_2.xlsx（每个对象一个工作表）')
+        files = app.split_workbook(source, None, 1, 1, out, single_workbook=True)
+        self.assertEqual(files[0].name, '源表_拆分_2.xlsx')
+        self.assertEqual((out / '源表_拆分.xlsx').read_bytes(), b'occupied')
+
+    def test_planned_names_follow_the_output_directory(self):
+        self.load(self.make_source())
+        first_item = next(iter(self.gui.group_items))
+        self.assertEqual(self.gui.split_preview_table.set(first_item, 'output'), '源表_甲.xlsx')
+        other = self.folder / 'elsewhere'
+        other.mkdir()
+        (other / '源表_甲.xlsx').write_bytes(b'occupied')
+        self.gui.output_var.set(str(other))
+        self.assertEqual(self.gui.split_preview_table.set(first_item, 'output'), '源表_甲_2.xlsx')
+
     def test_settings_are_remembered(self):
         self.gui.mode_var.set('row')
         self.gui.header_cols_var.set('2')
         self.gui.name_template_var.set('{序号}_{关键字}')
-        self.gui._close()
+        self.close_gui()
         self.gui = self.open_gui()
         self.assertEqual((self.gui.mode_var.get(), self.gui.header_cols_var.get(), self.gui.name_template_var.get()),
                          ('row', '2', '{序号}_{关键字}'))
         for content in ('not json', '{"mode": "sideways", "header_rows": "-1", "name_template": 5}'):
-            self.gui._close()
+            self.close_gui()
             self.settings.write_text(content, encoding='utf-8')
             self.gui = self.open_gui()
             self.assertEqual((self.gui.mode_var.get(), self.gui.header_rows_var.get(), self.gui.name_template_var.get()),

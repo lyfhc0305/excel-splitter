@@ -196,16 +196,35 @@ class ReferenceMapper:
         result = self.mapping[self.indices[left]], self.mapping[self.indices[right - 1]]
         return result if start <= end else result[::-1]
 
+    def _is_local_sheet(self, text):
+        """Whether ``text`` is unqualified or names the sheet currently being split."""
+        if '!' not in text:
+            return True
+        sheet = text.rsplit('!', 1)[0]
+        decoded = sheet[1:-1].replace("''", "'") if sheet.startswith("'") and sheet.endswith("'") else sheet
+        return self.sheet_name is not None and decoded.casefold() == self.sheet_name.casefold()
+
+    def hyperlink(self, text):
+        """Remap a hyperlink pointing into the split sheet; keep any other target as written.
+
+        The split never edits other sheets or external workbooks, so their locations are
+        already correct, and the output workbook does not carry those sheets along — so
+        rewriting them is impossible while dropping them would silently lose the link.
+        """
+        if not self._is_local_sheet(text):
+            return text
+        return self.reference(text)
+
     def reference(self, text):
         prefix = ''
         if '!' in text:
-            sheet, text = text.rsplit('!', 1)
-            decoded = sheet[1:-1].replace("''", "'") if sheet.startswith("'") and sheet.endswith("'") else sheet
-            if self.sheet_name is None or decoded.casefold() != self.sheet_name.casefold():
-                raise ValueError(f'公式引用了其他工作表或外部文件：{sheet}!{text}。请先将这类引用转换为值后拆分。')
+            sheet, rest = text.rsplit('!', 1)
+            if not self._is_local_sheet(text):
+                raise ValueError(f'公式引用了其他工作表或外部文件：{sheet}!{rest}。请先将这类引用转换为值后拆分。')
             if self.target_name is not None and self.target_name != self.sheet_name:
                 sheet = quote_sheetname(self.target_name)
             prefix = sheet + '!'
+            text = rest
         parts = text.split(':')
         matches = [CELL.fullmatch(part) for part in parts]
         if len(parts) <= 2 and all(matches):
@@ -296,7 +315,7 @@ def copy_cell(source, target, mapper):
     if source.hyperlink:
         target.hyperlink = copy.copy(source.hyperlink)
         if target.hyperlink.location:
-            target.hyperlink.location = mapper.reference(target.hyperlink.location)
+            target.hyperlink.location = mapper.hyperlink(target.hyperlink.location)
     if source.comment:
         target.comment = copy.copy(source.comment)
 
