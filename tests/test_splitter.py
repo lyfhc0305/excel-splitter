@@ -47,12 +47,31 @@ class FormulaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '动态引用'):
             core.rebuild_formula('=INDIRECT("B4")', {4: 1})
 
+    def test_same_sheet_prefix_on_both_ends_is_remapped(self):
+        self.assertEqual(
+            core.rebuild_formula('=SUM(Sheet!B2:Sheet!B4)', {1: 1, 2: 2, 4: 3}, sheet_name='Sheet'),
+            '=SUM(Sheet!B2:B3)',
+        )
+        self.assertEqual(
+            core.rebuild_formula("=SUM('My Sheet'!B2:'My Sheet'!B4)", {1: 1, 2: 2, 4: 3}, sheet_name='My Sheet'),
+            "=SUM('My Sheet'!B2:B3)",
+        )
+        mapper = core.ReferenceMapper({1: 1, 2: 2, 4: 3}, sheet_name='Sheet', target_name='甲')
+        self.assertEqual(mapper.formula('=Sheet!B4'), "='甲'!B3")
+
+
+
 
 class NamingAndGroupingTests(unittest.TestCase):
     def test_group_values_follow_excel_display(self):
         values = [3.0, 0.1 + 0.2, True, datetime.datetime(2026, 9, 25), datetime.datetime(2026, 9, 25, 8, 30), ' x ', '']
         self.assertEqual([core.normalize_group_value(value) for value in values],
                          ['3', '0.3', 'TRUE', '2026-09-25', '2026-09-25 08:30:00', 'x', None])
+        # General format only: uppercase E, not Python's e+ and not a custom format.
+        self.assertEqual(core.normalize_group_value(1e16), '1E+16')
+        self.assertEqual(core.normalize_group_value(1234567890123456.0), '1.23457E+15')
+        self.assertEqual(core.normalize_group_value(1.23e-8), '1.23E-08')
+        self.assertNotIn('e+', core.normalize_group_value(-1e16))
 
     def test_sheet_titles_are_valid_and_unique(self):
         used = set()
@@ -505,6 +524,112 @@ class SplitTests(unittest.TestCase):
         self.assertTrue(preview['column_headers'][0].startswith('★ A'))
 
 
+    def test_defined_names_and_conditional_formats_report_ref_errors(self):
+        wb, ws = self.save([['部门', '值'], ['甲', '=Amounts'], ['乙', 1]])
+        wb.defined_names.add(DefinedName('Amounts', attr_text="'Sheet'!$B$3"))
+        ws.conditional_formatting.add('B2:B3', FormulaRule(formula=['B3>1'], fill=PatternFill('solid', fgColor='FFFF0000')))
+        wb.save(self.source)
+        result = self.split()
+        self.assertTrue(result.warnings)
+        joined = '\n'.join(result.warnings)
+        self.assertIn('Amounts', joined)
+        self.assertIn('条件格式', joined)
+        self.assertIn('#REF!', openpyxl.load_workbook(result[0]).defined_names['Amounts'].attr_text)
+
+    def test_validation_list_and_cross_sheet_source_are_kept(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        other = wb.create_sheet('Lists')
+        other['A1'] = '甲'
+        other['A2'] = '乙'
+        ws.append(['部门', '值'])
+        ws.append(['甲', 1])
+        ws.append(['乙', 2])
+        listed = DataValidation(type='list', formula1='甲,乙')
+        listed.add('B2:B3')
+        remote = DataValidation(type='list', formula1='=Lists!$A$1:$A$2')
+        remote.add('A2:A3')
+        ws.add_data_validation(listed)
+        ws.add_data_validation(remote)
+        wb.save(self.source)
+        files = self.split()
+        self.assertEqual(len(files), 2)
+        warning = '\n'.join(files.warnings)
+        self.assertIn('甲,乙', warning)
+        self.assertIn('Lists!$A$1:$A$2', warning)
+        result = openpyxl.load_workbook(files[0])
+        formulas = {item.formula1 for item in result.active.data_validations.dataValidation}
+        self.assertIn('甲,乙', formulas)
+        self.assertIn('=Lists!$A$1:$A$2', formulas)
+        result.close()
+
+    def test_unknown_extension_still_splits_and_is_reported(self):
+        import zipfile
+        self.save([['部门', '值'], ['甲', 1], ['乙', 2]])
+        patched = self.source.with_name('扩展.xlsx')
+        with zipfile.ZipFile(self.source) as source, zipfile.ZipFile(patched, 'w') as target:
+            for item in source.infolist():
+                data = source.read(item.filename)
+                if item.filename.startswith('xl/worksheets/sheet'):
+                    text_xml = data.decode('utf-8')
+                    extension = (
+                        '<extLst><ext uri="{00000000-0000-0000-0000-000000000001}">'
+                        '<x:foo xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
+                        '</ext></extLst>'
+                    )
+                    text_xml = text_xml.replace('</worksheet>', extension + '</worksheet>')
+                    data = text_xml.encode('utf-8')
+                target.writestr(item, data)
+        self.source = patched
+        files = self.split()
+        self.assertEqual(len(files), 2)
+        self.assertTrue(any('extension is not supported' in item for item in files.warnings))
+
+    def test_shape_warning_stops_the_split(self):
+        self.save([['部门'], ['甲']])
+        real = openpyxl.load_workbook
+
+        def warn_shape(*args, **kwargs):
+            workbook = real(*args, **kwargs)
+            import warnings
+            warnings.warn(
+                'DrawingML support is incomplete and limited to charts and images only. '
+                'Shapes and drawings will be lost.'
+            )
+            return workbook
+
+        with patch.object(openpyxl, 'load_workbook', warn_shape):
+            with self.assertRaisesRegex(ValueError, '形状'):
+                self.split()
+        self.assertEqual(list(self.out.iterdir()) if self.out.exists() else [], [])
+
+    def test_legacy_vba_is_rejected_before_conversion(self):
+        legacy = self.source.with_suffix('.xls')
+        legacy.write_bytes(b'old-format' + '_VBA_PROJECT_CUR'.encode('utf-16le'))
+        plain = self.root / 'plain.xls'
+        plain.write_bytes(b'\xd0\xcf\x11\xe0plain')
+        with patch.object(app, 'convert_with_libreoffice', return_value=None) as libreoffice, \
+                patch.object(app, 'convert_with_windows_com', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'VBA'):
+                app.convert_to_xlsx(legacy)
+            libreoffice.assert_not_called()
+            with self.assertRaisesRegex(ValueError, '无法自动转换'):
+                app.convert_to_xlsx(plain)
+            libreoffice.assert_called_once()
+
+    def test_preview_names_reserve_existing_output_files(self):
+        self.save([['部门'], ['甲'], ['乙']])
+        self.out.mkdir()
+        (self.out / '源表_甲.xlsx').write_bytes(b'old')
+        reserved = core.occupied_output_names(self.source, self.out)
+        planned = core.plan_file_names('{文件名}_{关键字}', self.source.stem, 'Sheet', ['甲', '乙'], reserved)
+        files = self.split(name_template='{文件名}_{关键字}')
+        self.assertEqual([path.name for path in files], planned)
+        self.assertEqual(planned[0], '源表_甲_2.xlsx')
+        self.assertEqual((self.out / '源表_甲.xlsx').read_bytes(), b'old')
+
+
+
 class InterfaceTests(unittest.TestCase):
     def test_cli_new_options(self):
         args = app.parse_args(['--input', 'x.xlsx', '--header-rows', '1', '--key-column', '2', '--group', '甲',
@@ -699,7 +824,6 @@ class BackgroundInterfaceTests(unittest.TestCase):
         self.gui.render_preview_table(['A列/1: 甲'], [{'row_no': 1, 'kind': 'keyrow', 'values': ['甲']}])
         item = self.gui.preview_table.get_children()[0]
         self.assertEqual(self.gui.preview_table.item(item, 'tags'), ('keyrow',))
-
 
 if __name__ == '__main__':
     unittest.main()
